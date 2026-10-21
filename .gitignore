@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+.Python
+venv/
+.venv/
+
+# Build artifacts (rebuild with build_dmg.sh)
+OpenClip Editor.app/
+OpenClip Editor.dmg
+build/
+dist/
+*.egg-info/
