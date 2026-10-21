@@ -2,7 +2,6 @@
 Script Name:    OpenClip Editor
 Script Version: 2.0.0
 Flame Version:  2023.2+
-Written by:     UC
 
 Description:
     Right-click any .clip file in the MediaHub to open it in OpenClip Editor.
