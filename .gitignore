@@ -6,9 +6,7 @@ __pycache__/
 venv/
 .venv/
 
-# Build artifacts (rebuild with build_dmg.sh)
-OpenClip Editor.app/
-OpenClip Editor.dmg
+# Build artifacts (rebuild with build_dmg.sh → build/, dist/)
 build/
 dist/
 *.egg-info/
