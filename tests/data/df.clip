@@ -1,0 +1,70 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<clip type="clip" version="9">
+	<name type="string">sh010_df</name>
+	<sourceName type="string">A001_C001</sourceName>
+	<userData type="dict">
+		<appName type="binary">Autodesk Flame</appName>
+		<appVersion type="string">2027.1</appVersion>
+		<module type="string">Export</module>
+		<preset type="binary">/opt/Autodesk/shared/export/presets/demo.xml</preset>
+	</userData>
+	<tracks>
+		<track uid="v0">
+			<trackType>video</trackType>
+			<editRate type="rate">
+				<numerator>30000</numerator>
+				<denominator>1001</denominator>
+			</editRate>
+			<feeds currentVersion="v00">
+				<feed vuid="v00" uid="00000000000000000000000000000000">
+					<storageFormat type="format">
+						<type>video</type>
+						<channelsDepth type="uint">16</channelsDepth>
+						<channelsEncoding type="string">Float</channelsEncoding>
+						<channelsEndianess type="string">Little Endian</channelsEndianess>
+						<colourSpace type="string">Rec.709 video</colourSpace>
+						<compression type="string">DWAA</compression>
+						<fieldDominance type="int">2</fieldDominance>
+						<fileFormat type="string">exr</fileFormat>
+						<height type="uint">3164</height>
+						<nbChannels type="uint">3</nbChannels>
+						<pixelLayout type="string">RGB</pixelLayout>
+						<pixelRatio type="float">1</pixelRatio>
+						<width type="uint">4608</width>
+					</storageFormat>
+					<sampleRate>
+						<numerator>30000</numerator>
+						<denominator>1001</denominator>
+					</sampleRate>
+					<startTimecode type="time">
+						<rate>30</rate>
+						<nbTicks>107892</nbTicks>
+						<dropMode>DF</dropMode>
+					</startTimecode>
+					<startFrame>1001</startFrame>
+					<spans>
+						<span>
+							<duration>36</duration>
+							<trackIndex>0</trackIndex>
+							<path encoding="pattern">/jobs/DEMO_Job/SHOTS/sh010/Plates/v00/sh010.[1001-1036].exr</path>
+						</span>
+					</spans>
+				</feed>
+			</feeds>
+		</track>
+	</tracks>
+	<versions currentVersion="v00">
+		<version uid="v00">
+			<name>v00</name>
+			<creationDate>2026/10/21 12:15:54</creationDate>
+			<userData type="dict">
+				<appName type="binary">Autodesk Flame</appName>
+				<appVersion type="string">2027.1</appVersion>
+				<batchSetup type="binary">/jobs/DEMO_Job/SHOTS/sh010/Setups/sh010_v00.batch</batchSetup>
+				<module type="string">Export</module>
+				<preset type="binary">/opt/Autodesk/shared/export/presets/demo.xml</preset>
+				<versionNumber type="uint64">0</versionNumber>
+			</userData>
+		</version>
+	</versions>
+</clip>
