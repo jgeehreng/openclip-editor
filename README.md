@@ -16,7 +16,7 @@ Not affiliated with Autodesk.
 - Edit clip metadata, track info, and per-version feed details
 - Adjust start/out timecodes and frame ranges (with path frame tokens kept in sync)
 - Remove versions
-- **Fix Paths** — batch find/replace with validation and per-path overrides
+- **Fix Paths** — prefix (or match-anywhere) replacement across every track, span and batch setup path, with a preview of exactly what will change, frame-count validation (OK / partial / missing) and per-version overrides
 - OCIO color space picker (parsed from Flame’s config or built-in ACES 2.0 list), grouped by family
 - **Show in Finder** / **Open Folder** for the sequence path
 - macOS app: opens `.clip` files from Finder (double-click, Open With, drop on the Dock icon), one window per clip
@@ -53,17 +53,28 @@ python3 flame_hook/openclip_editor.py /path/to/shot.clip
 
 ## Flame hook (in-app)
 
-Install on a Flame workstation (requires write access to `/opt/Autodesk/shared/python`):
+Install on a Flame workstation:
 
 ```bash
-sudo bash flame_hook/install.sh
+bash flame_hook/install.sh
 ```
+
+The installer checks each Flame Python under `/opt/Autodesk/python/` for PySide, then copies the hook to `/opt/Autodesk/shared/python/openclip_editor/`. If you can't write there, it tells you to rerun it with `sudo`. To install somewhere else, set `OPENCLIP_INSTALL_DIR`.
 
 Then in Flame: **Python → Reload All Python Hooks**.
 
 **MediaHub** → right-click a `.clip` → **OpenClip Editor** → **Open in OpenClip Editor**.
 
 The hook uses **PySide2/PySide6** from Flame’s Python — no extra packages on Linux or macOS Flame hosts.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest tests
+```
+
+The tests run headless (`QT_QPA_PLATFORM=offscreen`) against the sample clips in `tests/data/`. They also run on every push and pull request via GitHub Actions. To run them with a Flame Python, put pytest on its `PYTHONPATH` and run `/opt/Autodesk/python/<version>/bin/python3 -m pytest tests`.
 
 ## Project layout
 
@@ -76,6 +87,8 @@ macos/
   OpenClipEditor.spec     # App bundle config (Info.plist, .clip document type)
   requirements-build.txt  # Pinned build tools
 build_dmg.sh              # Builds the .app + DMG into dist/
+tests/                    # pytest suite + sample clips (tests/data/)
+requirements-dev.txt      # Test dependencies
 OpenClipEditor.iconset/   # App icon source (.icns is generated at build time)
 ```
 

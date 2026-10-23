@@ -1,6 +1,6 @@
 """
 Script Name:    OpenClip Editor
-Script Version: 2.2.0
+Script Version: 2.3.0
 Flame Version:  2023.2+
 
 Description:
@@ -40,7 +40,7 @@ try:
         QLineEdit, QPushButton, QSpinBox, QComboBox, QTreeWidget,
         QTreeWidgetItem, QFrame, QFileDialog, QMessageBox, QTextEdit,
         QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy, QMenuBar,
-        QRadioButton, QScrollArea,
+        QRadioButton, QScrollArea, QCheckBox,
     )
     from PySide6.QtCore import Qt, QTimer, QEvent
     from PySide6.QtGui import (QAction, QKeySequence, QFont, QColor,
@@ -54,7 +54,7 @@ except ImportError:
             QLineEdit, QPushButton, QSpinBox, QComboBox, QTreeWidget,
             QTreeWidgetItem, QFrame, QFileDialog, QMessageBox, QTextEdit,
             QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy, QMenuBar,
-            QAction, QRadioButton, QScrollArea,
+            QAction, QRadioButton, QScrollArea, QCheckBox,
         )
         from PySide2.QtCore import Qt, QTimer, QEvent
         from PySide2.QtGui import (QKeySequence, QFont, QColor,
@@ -66,7 +66,7 @@ except ImportError:
 
 
 SCRIPT_NAME    = 'OpenClip Editor'
-SCRIPT_VERSION = 'v2.2.0'
+SCRIPT_VERSION = 'v2.3.0'
 
 
 # ─── Timecode utilities ────────────────────────────────────────────────────────
@@ -191,6 +191,28 @@ def pattern_from_file(filepath):
     frame_nums.sort()
     start, end = frame_nums[0], frame_nums[-1]
     return os.path.join(directory, f"{prefix}.[{start}-{end}].{ext}"), start, end
+
+
+def count_frames(path, listdir=os.listdir):
+    """(found, expected) media files for *path*.
+
+    For a '[start-end]' pattern, counts frames in that range present on disk (any
+    padding); for a plain path, (1, 1) if it exists else (0, 1).
+    """
+    s_fr, e_fr = extract_frame_range(path)
+    base = os.path.basename(path)
+    m = FRAME_RANGE_RE.search(base)
+    if s_fr is None or m is None:
+        return (1 if os.path.exists(path) else 0), 1
+    expected = e_fr - s_fr + 1
+    try:
+        names = listdir(os.path.dirname(path))
+    except OSError:
+        return 0, expected
+    frame_re = re.compile(
+        '^' + re.escape(base[:m.start()]) + r'(\d+)' + re.escape(base[m.end():]) + '$')
+    frames = {int(fm.group(1)) for fm in map(frame_re.match, names) if fm}
+    return sum(1 for f in frames if s_fr <= f <= e_fr), expected
 
 
 # ─── OCIO utilities ────────────────────────────────────────────────────────────
@@ -831,6 +853,13 @@ class OpenClipEditorDialog(QDialog):
         g.addWidget(_hbox(self.feed_path_edit, apply_path, finder_btn), row, 1, 1, 2)
         row += 1
 
+        self.span_warn_label = QLabel("")
+        self.span_warn_label.setStyleSheet("color: #e67e22;")
+        self.span_warn_label.setWordWrap(True)
+        self.span_warn_label.hide()
+        g.addWidget(self.span_warn_label, row, 1, 1, 2)
+        row += 1
+
         # Start Frame
         g.addWidget(QLabel("Start Frame:"), row, 0, Qt.AlignRight)
         self.start_frame_spin = QSpinBox()
@@ -958,6 +987,7 @@ class OpenClipEditorDialog(QDialog):
         self.res_label.setText("—")
         self.color_edit.setCurrentText("")
         self.format_label.setText("—")
+        self.span_warn_label.hide()
 
     # ── Populate ──────────────────────────────────────────────────────────────
 
@@ -969,6 +999,12 @@ class OpenClipEditorDialog(QDialog):
         self.clip_name_edit.setText(self._get_text(clip, "name") or "")
         self.source_name_edit.setText(self._get_text(clip, "sourceName") or "")
 
+        # Reset first: a clip without these nodes must not show the previous clip's values
+        for label in (self.flame_ver_label, self.module_label,
+                      self.edit_rate_label, self.track_type_label):
+            label.setText("—")
+        self.track_name_edit.setText("")
+
         ud = clip.find("userData")
         if ud is not None:
             self.flame_ver_label.setText(self._get_text(ud, "appVersion") or "—")
@@ -978,10 +1014,12 @@ class OpenClipEditorDialog(QDialog):
         if track is not None:
             self.track_name_edit.setText(self._get_text(track, "name") or "")
             er = track.find("editRate")
-            if er is not None:
-                num = int(er.findtext("numerator") or 24000)
-                den = int(er.findtext("denominator") or 1001)
+            try:
+                num = int(er.findtext("numerator"))
+                den = int(er.findtext("denominator"))
                 self.edit_rate_label.setText(f"{num/den:.3f} fps  ({num}/{den})")
+            except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+                pass
             self.track_type_label.setText(self._get_text(track, "trackType") or "—")
 
         self._populate_versions_table()
@@ -1111,7 +1149,13 @@ class OpenClipEditorDialog(QDialog):
             self.tc_info_label.setText(
                 f"{'DF' if drop else 'NDF'}  {self._feed_fps_text(feed, rate)}")
 
-        # Path
+        # Path (only the first span is editable here; Fix Paths handles all of them)
+        n_spans = len(feed.findall("spans/span"))
+        if n_spans > 1:
+            self.span_warn_label.setText(
+                f"⚠ This version has {n_spans} spans. Only the first is shown and edited "
+                "here; Tools → Fix Paths updates all of them.")
+            self.span_warn_label.show()
         span = feed.find("spans/span")
         if span is not None:
             path_elem = span.find("path")
@@ -1716,6 +1760,7 @@ class FixPathsDialog(QDialog):
         g.setColumnStretch(1, 1)
         g.addWidget(QLabel("Find:"),    0, 0, Qt.AlignRight)
         self.find_edit = QLineEdit()
+        self.find_edit.setPlaceholderText("e.g. /Volumes/vfx/UC_Jobs/")
         g.addWidget(self.find_edit,     0, 1)
         g.addWidget(QLabel("Replace:"), 1, 0, Qt.AlignRight)
         self.replace_edit = QLineEdit()
@@ -1724,16 +1769,18 @@ class FixPathsDialog(QDialog):
         self.scope_all = QRadioButton("All versions")
         self.scope_sel = QRadioButton("Selected version only")
         self.scope_all.setChecked(True)
-        scope_row = _hbox(self.scope_all, self.scope_sel, 'stretch')
-        g.addWidget(scope_row, 2, 0, 1, 2)
+        self.batch_cb = QCheckBox("Include batch setup paths")
+        self.batch_cb.setChecked(True)
+        self.anywhere_cb = QCheckBox("Match anywhere in path (not just the start)")
+        g.addWidget(_hbox(self.scope_all, self.scope_sel, 16, self.batch_cb, 'stretch'),
+                    2, 0, 1, 2)
+        g.addWidget(self.anywhere_cb, 3, 0, 1, 2)
 
-        btn_row = _hbox(
-            QPushButton("Preview"),
-            QPushButton("Apply to Feeds"),
-            'stretch')
-        btn_row.layout().itemAt(0).widget().clicked.connect(self._preview_replace)
-        btn_row.layout().itemAt(1).widget().clicked.connect(self._apply_replace)
-        g.addWidget(btn_row, 3, 0, 1, 2)
+        preview_btn = QPushButton("Preview")
+        preview_btn.clicked.connect(self._preview_replace)
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(self._apply_replace)
+        g.addWidget(_hbox(preview_btn, apply_btn, 'stretch'), 4, 0, 1, 2)
         lay.addWidget(batch_gr)
 
         # Validation table
@@ -1745,8 +1792,8 @@ class FixPathsDialog(QDialog):
         self.val_tree.setRootIsDecorated(False)
         self.val_tree.setColumnWidth(0, 70)
         self.val_tree.setColumnWidth(1, 70)
-        self.val_tree.setColumnWidth(2, 580)
-        self.val_tree.setColumnWidth(3, 120)
+        self.val_tree.setColumnWidth(2, 540)
+        self.val_tree.setColumnWidth(3, 160)
         vl.addWidget(self.val_tree)
         recheck = QPushButton("Recheck All")
         recheck.clicked.connect(self._recheck_all)
@@ -1776,28 +1823,24 @@ class FixPathsDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         lay.addWidget(close_btn, alignment=Qt.AlignRight)
 
-    def _iter_all_paths(self):
-        # Feed paths on every track; non-video tracks are labelled e.g. "v00 (audio)"
+    def _path_targets(self):
+        """(vuid, label, kind, elem) for every path in the clip: each span of each feed
+        on every track ("feed") and each version's batch setup ("batch")."""
         for track in self.editor._get_tracks():
             ttype = (track.findtext("trackType") or "").strip()
             feeds = track.find("feeds")
             for feed in (feeds if feeds is not None else []):
                 vuid  = feed.get("vuid", "")
                 label = vuid if ttype in ("", "video") else f"{vuid} ({ttype})"
-                pe = feed.find("spans/span/path")
-                if pe is not None and pe.text:
-                    yield label, pe.text.strip(), "feed"
+                paths = [pe for pe in feed.findall("spans/span/path") if pe.text]
+                for i, pe in enumerate(paths):
+                    yield vuid, (label if len(paths) == 1 else f"{label} span {i + 1}"), \
+                        "feed", pe
         versions_elem = self.editor.clip_elem.find("versions")
-        if versions_elem is not None:
-            for ver in versions_elem:
-                if ver.tag != "version":
-                    continue
-                vuid = ver.get("uid", "")
-                ud   = ver.find("userData")
-                if ud is not None:
-                    bs = ud.find("batchSetup")
-                    if bs is not None and bs.text:
-                        yield vuid, bs.text.strip(), "batch"
+        for ver in (versions_elem if versions_elem is not None else []):
+            bs = ver.find("userData/batchSetup") if ver.tag == "version" else None
+            if bs is not None and bs.text:
+                yield ver.get("uid", ""), ver.get("uid", ""), "batch", bs
 
     def _recheck_all(self):
         self.val_tree.clear()
@@ -1805,61 +1848,94 @@ class FixPathsDialog(QDialog):
         GREEN  = "#27ae60"
         GRAY   = "#7f8c8d"
         ORANGE = "#e67e22"
-        for vuid, path, kind in self._iter_all_paths():
+        listings = {}
+
+        def cached_listdir(directory):
+            if directory not in listings:
+                try:
+                    listings[directory] = os.listdir(directory)
+                except OSError as e:
+                    listings[directory] = e
+            if isinstance(listings[directory], OSError):
+                raise listings[directory]
+            return listings[directory]
+
+        for _vuid, label, kind, elem in self._path_targets():
+            path = elem.text.strip()
             if kind == "batch":
                 exists = os.path.exists(path)
                 color  = GRAY if exists else ORANGE
                 status = "✓ OK" if exists else "✗ MISSING"
             else:
-                exists = os.path.isdir(os.path.dirname(path))
-                color  = GREEN if exists else RED
-                status = "✓ OK" if exists else "✗ MISSING"
-            item = QTreeWidgetItem([vuid, kind, path, status])
+                found, expected = count_frames(path, cached_listdir)
+                counts = f"  {found}/{expected}" if expected > 1 else ""
+                if found == expected:
+                    color, status = GREEN, "✓ OK" + counts
+                elif found:
+                    color, status = ORANGE, "⚠ PARTIAL" + counts
+                else:
+                    color, status = RED, "✗ MISSING" + counts
+            item = QTreeWidgetItem([label, kind, path, status])
             item.setForeground(3, QColor(color))
             self.val_tree.addTopLevelItem(item)
 
+    def _replacement(self, path):
+        """New path for *path* under the current Find/Replace, or None if it doesn't match."""
+        find, replace = self.find_edit.text(), self.replace_edit.text()
+        if self.anywhere_cb.isChecked():
+            return path.replace(find, replace) if find in path else None
+        return replace + path[len(find):] if path.startswith(find) else None
+
+    def _planned_changes(self):
+        """[(label, kind, elem, old, new)] that Apply would make — Preview shows the same."""
+        sel_vuid = self.editor._current_vuid
+        changes = []
+        for vuid, label, kind, elem in self._path_targets():
+            if kind == "batch" and not self.batch_cb.isChecked():
+                continue
+            if self.scope_sel.isChecked() and vuid != sel_vuid:
+                continue
+            old = elem.text.strip()
+            new = self._replacement(old)
+            if new is not None and new != old:
+                changes.append((label, kind, elem, old, new))
+        return changes
+
+    def _no_matches(self):
+        where = "anywhere in" if self.anywhere_cb.isChecked() else "at the start of"
+        QMessageBox.information(
+            self, "No Matches", f"No paths in scope have this {where} them:\n"
+            f"{self.find_edit.text()}")
+
     def _preview_replace(self):
-        find = self.find_edit.text()
-        if not find:
+        if not self.find_edit.text():
             QMessageBox.warning(self, "Empty Find", "Please enter a string to find.")
             return
-        replace = self.replace_edit.text()
-        lines = []
-        for vuid, path, kind in self._iter_all_paths():
-            if kind != "feed":
-                continue
-            if find in path:
-                lines.append(f"[{vuid}]\n  OLD: {path}\n  NEW: {path.replace(find, replace)}")
-        if not lines:
-            QMessageBox.information(self, "No Matches",
-                                    f"No feed paths contain:\n{find}")
+        changes = self._planned_changes()
+        if not changes:
+            self._no_matches()
             return
-        PreviewDialog(self, "\n\n".join(lines))
+        PreviewDialog(self, "\n\n".join(
+            f"[{label} · {kind}]\n  OLD: {old}\n  NEW: {new}"
+            for label, kind, _elem, old, new in changes))
 
     def _apply_replace(self):
-        find = self.find_edit.text()
-        if not find:
+        if not self.find_edit.text():
             QMessageBox.warning(self, "Empty Find", "Please enter a string to find.")
             return
-        replace      = self.replace_edit.text()
-        scope_all    = self.scope_all.isChecked()
-        sel_vuid     = self.editor._current_vuid
-        count = 0
-        for feed in self.editor._get_all_feeds(all_tracks=True):
-            vuid = feed.get("vuid", "")
-            if not scope_all and vuid != sel_vuid:
-                continue
-            span = feed.find("spans/span")
-            if span is not None:
-                pe = span.find("path")
-                if pe is not None and pe.text and find in pe.text:
-                    pe.text = pe.text.replace(find, replace)
-                    count += 1
-        if count:
-            self.editor._mark_dirty()
-            self.editor._populate_feed_details(self.editor._current_vuid)
+        changes = self._planned_changes()
+        if not changes:
+            self._no_matches()
+            return
+        for _label, _kind, elem, _old, new in changes:
+            elem.text = new
+        self.editor._mark_dirty()
+        self.editor._populate_feed_details(self.editor._current_vuid)
         self._recheck_all()
-        QMessageBox.information(self, "Done", f"Updated {count} feed path(s).")
+        n_batch = sum(1 for c in changes if c[1] == "batch")
+        QMessageBox.information(
+            self, "Done", f"Updated {len(changes) - n_batch} media path(s)"
+            + (f" and {n_batch} batch setup path(s)." if n_batch else "."))
 
     def _browse_frame(self):
         path, _ = QFileDialog.getOpenFileName(
