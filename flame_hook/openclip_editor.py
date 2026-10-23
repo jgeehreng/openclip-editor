@@ -24,8 +24,10 @@ Standalone test (outside Flame):
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from collections import OrderedDict
 from io import BytesIO
 import xml.etree.ElementTree as ET
@@ -67,8 +69,33 @@ SCRIPT_VERSION = 'v2.0.0'
 
 # ─── Timecode utilities ────────────────────────────────────────────────────────
 
-def ticks_to_tc(nb_ticks, rate):
+def tc_rate(tc_elem):
+    """Integer timecode rate of a <startTimecode>-style element (24 if missing/invalid)."""
+    try:
+        return max(int(round(float(tc_elem.findtext("rate") or 24))), 1)
+    except (TypeError, ValueError):
+        return 24
+
+
+def tc_is_drop(tc_elem):
+    return (tc_elem.findtext("dropMode") or "NDF").strip().upper() == "DF"
+
+
+def _dropped_per_minute(rate, drop):
+    """Frame numbers skipped each minute in drop-frame TC (2 at 30fps, 4 at 60fps)."""
+    return 2 * (rate // 30) if drop and rate % 30 == 0 else 0
+
+
+def ticks_to_tc(nb_ticks, rate, drop=False):
     rate = max(int(rate), 1)
+    d = _dropped_per_minute(rate, drop)
+    if d:
+        per_10min = rate * 600 - d * 9
+        per_min   = rate * 60 - d
+        tens, rem = divmod(nb_ticks, per_10min)
+        nb_ticks += d * 9 * tens
+        if rem > d:
+            nb_ticks += d * ((rem - d) // per_min)
     ff = nb_ticks % rate
     total_sec = nb_ticks // rate
     ss = total_sec % 60
@@ -78,13 +105,18 @@ def ticks_to_tc(nb_ticks, rate):
     return hh, mm, ss, ff
 
 
-def tc_to_ticks(hh, mm, ss, ff, rate):
+def tc_to_ticks(hh, mm, ss, ff, rate, drop=False):
     rate = max(int(rate), 1)
-    return hh * rate * 3600 + mm * rate * 60 + ss * rate + ff
+    nb = hh * rate * 3600 + mm * rate * 60 + ss * rate + ff
+    d = _dropped_per_minute(rate, drop)
+    if d:
+        total_min = hh * 60 + mm
+        nb -= d * (total_min - total_min // 10)
+    return nb
 
 
-def tc_to_str(hh, mm, ss, ff):
-    return f"{hh:02d}:{mm:02d}:{ss:02d}:{ff:02d}"
+def tc_to_str(hh, mm, ss, ff, drop=False):
+    return f"{hh:02d}:{mm:02d}:{ss:02d}{';' if drop else ':'}{ff:02d}"
 
 
 # ─── Path utilities ────────────────────────────────────────────────────────────
@@ -308,7 +340,11 @@ def _indent_xml(elem, level=0, indent_char='\t'):
         elem.tail = pad if level else '\n'
 
 
-def write_clip(tree, path):
+def write_clip(tree, path, backup=False):
+    """Write the clip atomically: temp file in the same folder, then rename over *path*.
+
+    With *backup*, the existing file is first copied to ``<path>.bak``.
+    """
     root = tree.getroot()
     _indent_xml(root)
     buf = BytesIO()
@@ -317,8 +353,32 @@ def write_clip(tree, path):
         b"<?xml version='1.0' encoding='UTF-8'?>",
         b'<?xml version="1.0" encoding="UTF-8"?>'
     )
-    with open(path, 'wb') as fh:
-        fh.write(content)
+    path = os.path.realpath(path)
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.',
+                               suffix='.tmp', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if os.path.exists(path):
+            if backup:
+                shutil.copy2(path, path + '.bak')
+            try:
+                shutil.copymode(path, tmp)
+            except OSError:
+                pass
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp, 0o666 & ~umask)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -362,6 +422,9 @@ class OpenClipEditorDialog(QDialog):
         self._dirty        = False
         self._current_vuid = None
         self._status_timer = None
+        self._feed_snapshot    = None    # Feed Details widget values as last loaded
+        self._applying_pending = False   # batch-applying edits: skip per-field refresh
+        self._backed_up        = set()   # paths already copied to .bak this session
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -479,6 +542,10 @@ class OpenClipEditorDialog(QDialog):
         self.track_type_label = QLabel("—")
         g.addWidget(self.track_type_label, 2, 1)
         lay.addWidget(track_gr)
+
+        # These are written on save, so mark dirty as soon as they're typed in
+        for edit in (self.clip_name_edit, self.source_name_edit, self.track_name_edit):
+            edit.textEdited.connect(lambda _text: self._mark_dirty())
 
         # Current Version
         cur_gr = QGroupBox("Current Version")
@@ -698,6 +765,7 @@ class OpenClipEditorDialog(QDialog):
 
     def _set_empty_state(self):
         self._current_vuid = None
+        self._feed_snapshot = None
         self.ver_tree.clear()
         self._clear_feed_details()
         self._set_widgets_enabled(False)
@@ -797,7 +865,7 @@ class OpenClipEditorDialog(QDialog):
             item.setData(0, Qt.UserRole, vuid)
             self.ver_tree.addTopLevelItem(item)
 
-    def _select_version_in_table(self, vuid):
+    def _select_version_in_table(self, vuid, populate=True):
         for i in range(self.ver_tree.topLevelItemCount()):
             item = self.ver_tree.topLevelItem(i)
             if item.data(0, Qt.UserRole) == vuid:
@@ -805,9 +873,55 @@ class OpenClipEditorDialog(QDialog):
                 self.ver_tree.setCurrentItem(item)
                 self.ver_tree.blockSignals(False)
                 break
-        self._populate_feed_details(vuid)
+        if populate:
+            self._populate_feed_details(vuid)
 
     def _populate_feed_details(self, vuid):
+        self._fill_feed_details(vuid)
+        self._feed_snapshot = self._feed_widget_values()
+
+    def _refresh_feed_details(self):
+        """Reload Feed Details from the XML after an Apply (deferred while batch-applying)."""
+        if not self._applying_pending:
+            self._populate_feed_details(self._current_vuid)
+
+    def _feed_widget_values(self):
+        """Current Feed Details values, in the order pending edits are applied."""
+        return OrderedDict([
+            ("Version Name", self.ver_name_edit.text().strip()),
+            ("Start TC",     (self.tc_hh.value(), self.tc_mm.value(),
+                              self.tc_ss.value(), self.tc_ff.value())),
+            ("Path",         self.feed_path_edit.text().strip()),
+            ("Start Frame",  self.start_frame_spin.value()),
+            ("End Frame",    self.end_frame_spin.value()),
+            ("Color Space",  self.color_edit.currentText().strip()),
+        ])
+
+    def _pending_fields(self):
+        """Feed Details fields edited but not yet applied to the XML."""
+        if not self._current_vuid or self._feed_snapshot is None:
+            return []
+        current = self._feed_widget_values()
+        return [k for k, v in current.items() if v != self._feed_snapshot.get(k)]
+
+    def _apply_pending(self, fields):
+        appliers = {
+            "Version Name": self._apply_version_name,
+            "Start TC":     self._apply_timecode,
+            "Path":         self._apply_feed_path,
+            "Start Frame":  self._apply_start_frame,
+            "End Frame":    self._apply_end_frame,
+            "Color Space":  self._apply_color_space,
+        }
+        self._applying_pending = True
+        try:
+            for name in fields:
+                appliers[name]()
+        finally:
+            self._applying_pending = False
+        self._populate_feed_details(self._current_vuid)
+
+    def _fill_feed_details(self, vuid):
         self._current_vuid = vuid
         self._clear_feed_details()
         if not vuid:
@@ -827,19 +941,20 @@ class OpenClipEditorDialog(QDialog):
         # Timecode
         tc_elem = feed.find("startTimecode")
         if tc_elem is not None:
-            rate = int(tc_elem.findtext("rate") or 24)
+            rate = tc_rate(tc_elem)
             nb   = int(tc_elem.findtext("nbTicks") or 0)
-            drop = tc_elem.findtext("dropMode") or "NDF"
-            hh, mm, ss, ff = ticks_to_tc(nb, rate)
+            drop = tc_is_drop(tc_elem)
+            hh, mm, ss, ff = ticks_to_tc(nb, rate, drop)
             self.tc_hh.setValue(hh)
             self.tc_mm.setValue(mm)
             self.tc_ss.setValue(ss)
             self.tc_ff.setValue(ff)
-            self.tc_info_label.setText(f"{drop}  {rate}fps")
+            self.tc_info_label.setText(f"{'DF' if drop else 'NDF'}  {rate}fps")
             duration = self._get_feed_duration(feed)
             if duration is not None:
-                oh, om, os_, of_ = ticks_to_tc(nb + duration, rate)
-                self.out_tc_label.setText(f"{tc_to_str(oh, om, os_, of_)}  ({duration} frames)")
+                oh, om, os_, of_ = ticks_to_tc(nb + duration, rate, drop)
+                self.out_tc_label.setText(
+                    f"{tc_to_str(oh, om, os_, of_, drop)}  ({duration} frames)")
 
         # Path
         span = feed.find("spans/span")
@@ -910,84 +1025,80 @@ class OpenClipEditorDialog(QDialog):
     def _on_current_version_changed(self, idx):
         if idx < 0:
             return
-        vuid  = self.current_version_cb.currentText()
-        track = self._get_track()
-        if track is not None:
-            feeds = track.find("feeds")
-            if feeds is not None:
-                feeds.set("currentVersion", vuid)
-        versions_elem = self.clip_elem.find("versions")
-        if versions_elem is not None:
-            versions_elem.set("currentVersion", vuid)
+        vuid = self.current_version_cb.currentText()
+        self._set_current_version(vuid)
         self._mark_dirty()
         self._select_version_in_table(vuid)
 
     # ── Apply helpers ─────────────────────────────────────────────────────────
 
+    def _warn(self, title, msg):
+        QMessageBox.warning(self, title, msg)
+
     def _apply_version_name(self):
         if not self._current_vuid:
             return
         new_name = self.ver_name_edit.text().strip()
-        versions_elem = self.clip_elem.find("versions")
-        if versions_elem is not None:
-            for ver in versions_elem:
-                if ver.get("uid") == self._current_vuid:
-                    ne = ver.find("name")
-                    if ne is not None:
-                        ne.text = new_name
-                    break
+        ver = self._get_version(self._current_vuid)
+        if ver is None:
+            self._warn("Version Not Found",
+                       f"No <version> entry for {self._current_vuid}; name not changed.")
+            return
+        ne = ver.find("name")
+        if ne is None:
+            ne = ET.Element("name")
+            ver.insert(0, ne)
+        ne.text = new_name
         self._populate_versions_table()
-        self._select_version_in_table(self._current_vuid)
+        self._select_version_in_table(self._current_vuid, populate=False)
         self._mark_dirty()
+        self._refresh_feed_details()
         self._set_status(f"Version name updated for {self._current_vuid}")
 
     def _apply_timecode(self):
         if not self._current_vuid:
-            return
-        feed = self._get_feed(self._current_vuid)
-        if feed is None:
             return
         hh = self.tc_hh.value()
         mm = self.tc_mm.value()
         ss = self.tc_ss.value()
         ff = self.tc_ff.value()
 
-        targets = [feed.find("startTimecode")]
-        ud = feed.find("userData")
-        if ud is not None:
-            rec = ud.find("recordTimecode")
-            if rec is not None:
-                targets.append(rec)
+        # Every track's feed for this version (video + audio) so they stay in sync
+        targets = []
+        for feed in self._get_feeds_for_version(self._current_vuid):
+            targets.append(feed.find("startTimecode"))
+            ud = feed.find("userData")
+            if ud is not None:
+                targets.append(ud.find("recordTimecode"))
+        targets = [t for t in targets if t is not None and t.find("nbTicks") is not None]
+        if not targets:
+            self._warn("No Timecode",
+                       f"No <startTimecode> found for {self._current_vuid}; nothing changed.")
+            return
 
         for tc_elem in targets:
-            if tc_elem is None:
-                continue
-            rate = int(tc_elem.findtext("rate") or 24)
-            nb   = tc_to_ticks(hh, mm, ss, ff, rate)
-            nb_e = tc_elem.find("nbTicks")
-            if nb_e is not None:
-                nb_e.text = str(nb)
+            drop = tc_is_drop(tc_elem)
+            tc_elem.find("nbTicks").text = str(
+                tc_to_ticks(hh, mm, ss, ff, tc_rate(tc_elem), drop))
             if tc_elem.get("label"):
-                tc_elem.set("label", tc_to_str(hh, mm, ss, ff))
+                tc_elem.set("label", tc_to_str(hh, mm, ss, ff, drop))
 
         self._mark_dirty()
-        self._populate_feed_details(self._current_vuid)
+        self._refresh_feed_details()
         self._set_status(f"Timecode updated for {self._current_vuid}")
 
     def _apply_feed_path(self):
         if not self._current_vuid:
             return
-        feed = self._get_feed(self._current_vuid)
-        if feed is None:
+        pe = self._get_feed_path_elem(self._get_feed(self._current_vuid))
+        if pe is None:
+            self._warn("No Path Element",
+                       f"The feed for {self._current_vuid} has no <spans>/<span>/<path>; "
+                       "nothing changed.")
             return
-        new_path = self.feed_path_edit.text().strip()
-        span = feed.find("spans/span")
-        if span is not None:
-            pe = span.find("path")
-            if pe is not None:
-                pe.text = new_path
+        pe.text = self.feed_path_edit.text().strip()
         self._mark_dirty()
-        self._populate_feed_details(self._current_vuid)
+        self._refresh_feed_details()
         self._set_status(f"Path updated for {self._current_vuid}")
 
     def _show_in_finder(self):
@@ -1026,14 +1137,18 @@ class OpenClipEditorDialog(QDialog):
         if not self._current_vuid:
             return
         feed = self._get_feed(self._current_vuid)
-        if feed is None:
+        sf_elem = feed.find("storageFormat") if feed is not None else None
+        if sf_elem is None:
+            self._warn("No Storage Format",
+                       f"The feed for {self._current_vuid} has no <storageFormat>; "
+                       "nothing changed.")
             return
-        sf_elem = feed.find("storageFormat")
-        if sf_elem is not None:
-            cs = sf_elem.find("colourSpace")
-            if cs is not None:
-                cs.text = self.color_edit.currentText().strip()
+        cs = sf_elem.find("colourSpace")
+        if cs is None:
+            cs = ET.SubElement(sf_elem, "colourSpace", {"type": "string"})
+        cs.text = self.color_edit.currentText().strip()
         self._mark_dirty()
+        self._refresh_feed_details()
         self._set_status(f"Color space updated for {self._current_vuid}")
 
     def _apply_start_frame(self):
@@ -1050,13 +1165,18 @@ class OpenClipEditorDialog(QDialog):
             sf_elem = ET.SubElement(feed, "startFrame")
             sf_elem.text = val
         self._mark_dirty()
+        self._refresh_feed_details()
         self._set_status(f"Start frame updated for {self._current_vuid}")
 
     def _apply_end_frame(self):
         if not self._current_vuid:
             return
-        self._set_feed_end_frame(self._current_vuid, self.end_frame_spin.value())
-        self._populate_feed_details(self._current_vuid)
+        if not self._set_feed_end_frame(self._current_vuid, self.end_frame_spin.value()):
+            self._warn("No Frame Range",
+                       f"The path for {self._current_vuid} has no [start-end] frame range; "
+                       "nothing changed.")
+            return
+        self._refresh_feed_details()
         self._set_status(f"End frame updated for {self._current_vuid}")
 
     def _apply_end_frame_all(self):
@@ -1071,39 +1191,44 @@ class OpenClipEditorDialog(QDialog):
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
-        for feed in feeds:
-            self._set_feed_end_frame(feed.get("vuid", ""), end)
-        self._populate_feed_details(self._current_vuid)
-        self._set_status(f"End frame set to {end} across all {len(feeds)} version(s)")
+        count = sum(1 for feed in feeds
+                    if self._set_feed_end_frame(feed.get("vuid", ""), end))
+        self._refresh_feed_details()
+        skipped = len(feeds) - count
+        self._set_status(f"End frame set to {end} on {count} version(s)"
+                         + (f" — {skipped} skipped (no frame range)" if skipped else ""))
 
     def _set_feed_end_frame(self, vuid, end_frame):
+        """Rewrite the [start-end] range and <duration>. Returns False if there's no range."""
         feed = self._get_feed(vuid)
-        if feed is None:
-            return
-        span = feed.find("spans/span")
-        if span is None:
-            return
-        pe = span.find("path")
-        if pe is not None and pe.text:
-            pe.text = FRAME_RANGE_RE.sub(
-                lambda m: f"[{m.group(1)}-{end_frame}]", pe.text)
-            s_fr, e_fr = extract_frame_range(pe.text)
-            if s_fr is not None:
-                dur_elem = span.find("duration")
-                if dur_elem is not None:
-                    dur_elem.text = str(e_fr - s_fr + 1)
+        pe = self._get_feed_path_elem(feed)
+        if pe is None or not FRAME_RANGE_RE.search(pe.text or ""):
+            return False
+        pe.text = FRAME_RANGE_RE.sub(
+            lambda m: f"[{m.group(1)}-{end_frame}]", pe.text)
+        s_fr, e_fr = extract_frame_range(pe.text)
+        dur_elem = feed.find("spans/span/duration")
+        if dur_elem is not None:
+            dur_elem.text = str(e_fr - s_fr + 1)
         self._mark_dirty()
+        return True
 
     def _apply_clip_meta(self):
-        self._set_text(self.clip_elem, "name", self.clip_name_edit.text())
-        self._set_text(self.clip_elem, "sourceName", self.source_name_edit.text())
+        string = {"type": "string"}
+        for tag, edit in (("name", self.clip_name_edit),
+                          ("sourceName", self.source_name_edit)):
+            value = edit.text()
+            self._set_text(self.clip_elem, tag, value, create=bool(value), attrib=string)
         track = self._get_track()
         if track is not None:
-            self._set_text(track, "name", self.track_name_edit.text())
+            value = self.track_name_edit.text()
+            self._set_text(track, "name", value, create=bool(value), attrib=string)
 
     # ── Commands ──────────────────────────────────────────────────────────────
 
     def cmd_open(self):
+        if not self._maybe_save_changes():
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Clip File", "",
             "Flame Clip Files (*.clip);;All Files (*)")
@@ -1128,42 +1253,92 @@ class OpenClipEditorDialog(QDialog):
         self._populate_from_xml()
 
     def cmd_save(self):
+        """Save to the current path. Returns True only if the file was written."""
+        if self.tree is None:
+            return False
         if self.clip_path is None:
-            self.cmd_save_as()
-            return
-        self._apply_clip_meta()
-        try:
-            write_clip(self.tree, self.clip_path)
-        except OSError as e:
-            QMessageBox.critical(self, "Save Error", f"Could not save file:\n{e}")
-            return
-        self._dirty = False
-        fname = os.path.basename(self.clip_path)
-        self.setWindowTitle(f"{SCRIPT_NAME} — {fname}")
-        self._set_status(f"Saved: {self.clip_path}")
-        _flame_refresh_mediahub()
+            return self.cmd_save_as()
+        if not self._resolve_pending():
+            return False
+        return self._write(self.clip_path)
 
     def cmd_save_as(self):
-        init = os.path.basename(self.clip_path) if self.clip_path else "clip.clip"
+        """Save to a new path. Returns True only if the file was written."""
+        if self.tree is None:
+            return False
+        init = self.clip_path or "clip.clip"
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Clip File As", init,
             "Flame Clip Files (*.clip);;All Files (*)")
         if not path:
-            return
+            return False
+        if not self._resolve_pending():
+            return False
+        return self._write(path)
+
+    def _write(self, path):
         self._apply_clip_meta()
+        # Keep the file as it was before this session's first save
+        backup = path not in self._backed_up and os.path.exists(path)
         try:
-            write_clip(self.tree, path)
+            write_clip(self.tree, path, backup=backup)
         except OSError as e:
-            QMessageBox.critical(self, "Save Error", f"Could not save file:\n{e}")
-            return
+            QMessageBox.critical(self, "Save Error",
+                                 f"Could not save file:\n{e}\n\nThe original file was not changed.")
+            return False
+        self._backed_up.add(path)
         self.clip_path = path
         self.path_label.setText(path)
         self.path_label.setStyleSheet("")
         self._dirty = False
         fname = os.path.basename(path)
         self.setWindowTitle(f"{SCRIPT_NAME} — {fname}")
-        self._set_status(f"Saved: {path}")
+        self._set_status(f"Saved: {path}" + (f"  (original kept as {fname}.bak)" if backup else ""))
         _flame_refresh_mediahub()
+        return True
+
+    def _resolve_pending(self):
+        """Offer to apply un-applied Feed Details edits. Returns False if the user cancels."""
+        fields = self._pending_fields()
+        if not fields:
+            return True
+        reply = QMessageBox.question(
+            self, "Unapplied Changes",
+            "These Feed Details edits haven't been applied:\n\n    "
+            + "\n    ".join(fields) + "\n\nApply them before saving?",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel, QMessageBox.Yes)
+        if reply == QMessageBox.Cancel:
+            return False
+        if reply == QMessageBox.Yes:
+            self._apply_pending(fields)
+        else:
+            self._populate_feed_details(self._current_vuid)
+        return True
+
+    def _maybe_save_changes(self):
+        """Before closing or replacing the clip: offer to save. Returns False on Cancel."""
+        if self.tree is None:
+            return True
+        pending = self._pending_fields()
+        if not self._dirty and not pending:
+            return True
+        fname = os.path.basename(self.clip_path) if self.clip_path else "this clip"
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Unsaved Changes")
+        msg.setText(f"Save changes to {fname}?")
+        if pending:
+            msg.setInformativeText("Includes un-applied edits: " + ", ".join(pending))
+        msg.setStandardButtons(
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        msg.setDefaultButton(QMessageBox.Save)
+        reply = msg.exec_()
+        if reply == QMessageBox.Cancel:
+            return False
+        if reply == QMessageBox.Save:
+            if pending:
+                self._apply_pending(pending)
+            return self.cmd_save()
+        return True
 
     def cmd_remove_version(self):
         items = self.ver_tree.selectedItems()
@@ -1173,45 +1348,33 @@ class OpenClipEditorDialog(QDialog):
         vuid = items[0].data(0, Qt.UserRole)
 
         versions_elem = self.clip_elem.find("versions")
-        ver_name = vuid
-        for v in (versions_elem if versions_elem is not None else []):
-            if v.get("uid") == vuid:
-                ver_name = self._get_text(v, "name") or vuid
-                break
+        ver = self._get_version(vuid)
+        ver_name = (self._get_text(ver, "name") if ver is not None else None) or vuid
 
         reply = QMessageBox.question(
             self, "Remove Version",
-            f"Remove version '{ver_name}' ({vuid})?\n\nThis will also remove its feed data.",
+            f"Remove version '{ver_name}' ({vuid})?\n\n"
+            "This also removes its feed on every track.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
 
-        if versions_elem is not None:
-            for v in list(versions_elem):
-                if v.get("uid") == vuid:
-                    versions_elem.remove(v)
-                    break
+        if ver is not None:
+            versions_elem.remove(ver)
 
-        track = self._get_track()
-        if track is not None:
+        # Drop this version's feeds from every track, not just the first
+        for track in self._get_tracks():
             feeds = track.find("feeds")
             if feeds is not None:
                 for f in list(feeds):
                     if f.get("vuid") == vuid:
                         feeds.remove(f)
-                        break
 
         remaining = [v.get("uid") for v in (versions_elem if versions_elem is not None else [])
                      if v.tag == "version"]
         cur = self.current_version_cb.currentText()
         new_cur = cur if cur in remaining else (remaining[-1] if remaining else "")
-
-        if versions_elem is not None:
-            versions_elem.set("currentVersion", new_cur)
-        if track is not None:
-            feeds = track.find("feeds")
-            if feeds is not None:
-                feeds.set("currentVersion", new_cur)
+        self._set_current_version(new_cur)
 
         self._mark_dirty()
         self._populate_versions_table()
@@ -1225,6 +1388,8 @@ class OpenClipEditorDialog(QDialog):
                 self.current_version_cb.setCurrentIndex(idx)
             self._select_version_in_table(new_cur)
         else:
+            self._current_vuid = None
+            self._feed_snapshot = None
             self._clear_feed_details()
         self._set_status(f"Removed version {vuid}")
 
@@ -1236,33 +1401,31 @@ class OpenClipEditorDialog(QDialog):
         dlg.exec_()
 
     def closeEvent(self, event):
-        if self._dirty:
-            msg = QMessageBox(self)
-            msg.setWindowTitle("Unsaved Changes")
-            msg.setText("You have unsaved changes. Save before closing?")
-            msg.setStandardButtons(
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
-            msg.setDefaultButton(QMessageBox.Save)
-            reply = msg.exec_()
-            if reply == QMessageBox.Cancel:
-                event.ignore()
-                return
-            if reply == QMessageBox.Save:
-                self.cmd_save()
+        if not self._maybe_save_changes():
+            event.ignore()
+            return
         event.accept()
         if self in _open_dialogs:
             _open_dialogs.remove(self)
 
     # ── XML access helpers ────────────────────────────────────────────────────
 
-    def _get_track(self):
+    def _get_tracks(self):
         if self.clip_elem is None:
-            return None
+            return []
         tracks = self.clip_elem.find("tracks")
-        return tracks.find("track") if tracks is not None else None
+        return tracks.findall("track") if tracks is not None else []
 
-    def _get_feed(self, vuid):
-        track = self._get_track()
+    def _get_track(self):
+        """The track Feed Details edits: the first video track, else the first track."""
+        tracks = self._get_tracks()
+        for track in tracks:
+            if (track.findtext("trackType") or "").strip() == "video":
+                return track
+        return tracks[0] if tracks else None
+
+    def _get_feed(self, vuid, track=None):
+        track = self._get_track() if track is None else track
         if track is None:
             return None
         feeds = track.find("feeds")
@@ -1273,12 +1436,41 @@ class OpenClipEditorDialog(QDialog):
                 return f
         return None
 
-    def _get_all_feeds(self):
-        track = self._get_track()
-        if track is None:
-            return []
-        feeds = track.find("feeds")
-        return list(feeds) if feeds is not None else []
+    def _get_feeds_for_version(self, vuid):
+        """This version's feed on every track (video, audio, ...)."""
+        feeds = (self._get_feed(vuid, track) for track in self._get_tracks())
+        return [f for f in feeds if f is not None]
+
+    def _get_all_feeds(self, all_tracks=False):
+        tracks = self._get_tracks() if all_tracks else [self._get_track()]
+        result = []
+        for track in tracks:
+            feeds = track.find("feeds") if track is not None else None
+            if feeds is not None:
+                result.extend(f for f in feeds if f.tag == "feed")
+        return result
+
+    def _get_version(self, vuid):
+        versions_elem = self.clip_elem.find("versions") if self.clip_elem is not None else None
+        if versions_elem is None:
+            return None
+        for ver in versions_elem:
+            if ver.tag == "version" and ver.get("uid") == vuid:
+                return ver
+        return None
+
+    def _set_current_version(self, vuid):
+        for track in self._get_tracks():
+            feeds = track.find("feeds")
+            if feeds is not None:
+                feeds.set("currentVersion", vuid)
+        versions_elem = self.clip_elem.find("versions")
+        if versions_elem is not None:
+            versions_elem.set("currentVersion", vuid)
+
+    @staticmethod
+    def _get_feed_path_elem(feed):
+        return feed.find("spans/span/path") if feed is not None else None
 
     def _get_text(self, elem, tag):
         if elem is None:
@@ -1286,12 +1478,15 @@ class OpenClipEditorDialog(QDialog):
         child = elem.find(tag)
         return child.text if child is not None else None
 
-    def _set_text(self, elem, tag, value):
+    def _set_text(self, elem, tag, value, create=False, attrib=None):
         if elem is None:
             return
         child = elem.find(tag)
-        if child is not None:
-            child.text = value
+        if child is None:
+            if not create:
+                return
+            child = ET.SubElement(elem, tag, attrib or {})
+        child.text = value
 
     # ── Dirty / status ────────────────────────────────────────────────────────
 
@@ -1400,13 +1595,16 @@ class FixPathsDialog(QDialog):
         lay.addWidget(close_btn, alignment=Qt.AlignRight)
 
     def _iter_all_paths(self):
-        for feed in self.editor._get_all_feeds():
-            vuid = feed.get("vuid", "")
-            span = feed.find("spans/span")
-            if span is not None:
-                pe = span.find("path")
+        # Feed paths on every track; non-video tracks are labelled e.g. "v00 (audio)"
+        for track in self.editor._get_tracks():
+            ttype = (track.findtext("trackType") or "").strip()
+            feeds = track.find("feeds")
+            for feed in (feeds if feeds is not None else []):
+                vuid  = feed.get("vuid", "")
+                label = vuid if ttype in ("", "video") else f"{vuid} ({ttype})"
+                pe = feed.find("spans/span/path")
                 if pe is not None and pe.text:
-                    yield vuid, pe.text.strip(), "feed"
+                    yield label, pe.text.strip(), "feed"
         versions_elem = self.editor.clip_elem.find("versions")
         if versions_elem is not None:
             for ver in versions_elem:
@@ -1465,7 +1663,7 @@ class FixPathsDialog(QDialog):
         scope_all    = self.scope_all.isChecked()
         sel_vuid     = self.editor._current_vuid
         count = 0
-        for feed in self.editor._get_all_feeds():
+        for feed in self.editor._get_all_feeds(all_tracks=True):
             vuid = feed.get("vuid", "")
             if not scope_all and vuid != sel_vuid:
                 continue
