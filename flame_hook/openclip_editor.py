@@ -1,6 +1,6 @@
 """
 Script Name:    OpenClip Editor
-Script Version: 2.1.0
+Script Version: 2.2.0
 Flame Version:  2023.2+
 
 Description:
@@ -44,7 +44,8 @@ try:
     )
     from PySide6.QtCore import Qt, QTimer, QEvent
     from PySide6.QtGui import (QAction, QKeySequence, QFont, QColor,
-                               QStandardItemModel, QStandardItem, QBrush)
+                               QStandardItemModel, QStandardItem, QBrush,
+                               QFontDatabase, QGuiApplication)
     _QT = 6
 except ImportError:
     try:
@@ -57,14 +58,15 @@ except ImportError:
         )
         from PySide2.QtCore import Qt, QTimer, QEvent
         from PySide2.QtGui import (QKeySequence, QFont, QColor,
-                                   QStandardItemModel, QStandardItem, QBrush)
+                                   QStandardItemModel, QStandardItem, QBrush,
+                                   QFontDatabase, QGuiApplication)
         _QT = 2
     except ImportError:
         _QT = None
 
 
 SCRIPT_NAME    = 'OpenClip Editor'
-SCRIPT_VERSION = 'v2.1.0'
+SCRIPT_VERSION = 'v2.2.0'
 
 
 # ─── Timecode utilities ────────────────────────────────────────────────────────
@@ -116,7 +118,43 @@ def tc_to_ticks(hh, mm, ss, ff, rate, drop=False):
 
 
 def tc_to_str(hh, mm, ss, ff, drop=False):
+    """Timecode as written to the clip XML (``label`` attributes)."""
     return f"{hh:02d}:{mm:02d}:{ss:02d}{';' if drop else ':'}{ff:02d}"
+
+
+def tc_separator(rate, drop=False):
+    """Seconds/frames separator for display: ';' drop-frame, '+' 24 and 23.976, else ':'."""
+    if _dropped_per_minute(rate, drop):
+        return ';'
+    return '+' if rate == 24 else ':'
+
+
+def tc_display(hh, mm, ss, ff, rate, drop=False):
+    return f"{hh:02d}:{mm:02d}:{ss:02d}{tc_separator(rate, drop)}{ff:02d}"
+
+
+def tc_is_valid(hh, mm, ss, ff, rate, drop=False):
+    """False for out-of-range fields and for frame numbers drop-frame skips."""
+    if not (0 <= mm < 60 and 0 <= ss < 60 and 0 <= ff < max(int(rate), 1) and hh >= 0):
+        return False
+    d = _dropped_per_minute(rate, drop)
+    return not (d and ss == 0 and ff < d and mm % 10)
+
+
+_TC_GROUPS_RE = re.compile(r'^\s*(\d{1,2})[:;+.,](\d{1,2})[:;+.,](\d{1,2})[:;+.,](\d{1,3})\s*$')
+
+
+def parse_tc_text(text):
+    """Parse '01:00:00:00' (any of : ; + . as separators) or bare digits filled from
+    the right ('1000000' -> 01:00:00:00). Returns (hh, mm, ss, ff) or None."""
+    m = _TC_GROUPS_RE.match(text or "")
+    if m:
+        return tuple(int(g) for g in m.groups())
+    digits = re.sub(r'\s', '', text or "")
+    if digits.isdigit() and len(digits) <= 8:
+        digits = digits.zfill(8)
+        return tuple(int(digits[i:i + 2]) for i in range(0, 8, 2))
+    return None
 
 
 # ─── Path utilities ────────────────────────────────────────────────────────────
@@ -410,6 +448,128 @@ def _hbox(*widgets, spacing=6):
     return w
 
 
+class TimecodeEdit(QLineEdit):
+    """Single-field timecode entry that works like Flame's TC fields.
+
+    Typed digits fill from the right (``1000000`` → ``01:00:00+00``), pasted
+    timecode in any common notation is accepted, Up/Down nudge one frame (Shift:
+    one second) and Esc reverts to the loaded value. Use value() to read it.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rate   = 24
+        self._drop   = False
+        self._loaded = ""      # text as last set by set_ticks()
+        self._digits = None    # digits typed since focus/select-all, or None
+        self.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        self.setFixedWidth(120)
+        self.setAlignment(Qt.AlignCenter)
+        self.setToolTip("Type digits (they fill from the right) or paste a timecode.\n"
+                        "Up/Down: ±1 frame   Shift+Up/Down: ±1 second\n"
+                        "Enter: apply   Esc: revert")
+        self.textChanged.connect(self._update_style)
+
+    # ── Public API ──
+
+    def set_format(self, rate, drop=False):
+        self._rate = max(int(rate), 1)
+        self._drop = drop
+
+    def set_ticks(self, nb_ticks):
+        """Show *nb_ticks* (frames since midnight); None clears the field."""
+        self._digits = None
+        text = "" if nb_ticks is None else tc_display(
+            *ticks_to_tc(nb_ticks, self._rate, self._drop), self._rate, self._drop)
+        self._loaded = text
+        self.setText(text)
+
+    def value(self):
+        """(hh, mm, ss, ff) if the text is a valid timecode for this rate, else None."""
+        parts = parse_tc_text(self.text())
+        if parts and tc_is_valid(*parts, self._rate, self._drop):
+            return parts
+        return None
+
+    def ticks(self):
+        parts = self.value()
+        return None if parts is None else tc_to_ticks(*parts, self._rate, self._drop)
+
+    # ── Editing ──
+
+    def _show(self, parts):
+        self.setText(tc_display(*parts, self._rate, self._drop))
+
+    def _show_digits(self):
+        self._show(parse_tc_text(self._digits))
+
+    def keyPressEvent(self, event):
+        key  = event.key()
+        text = event.text()
+        if event.matches(QKeySequence.Paste):
+            self._paste(QGuiApplication.clipboard().text())
+        elif text.isdigit() and len(text) == 1:
+            if self._digits is None or len(self.selectedText()) == len(self.text()):
+                self._digits = ""
+            self._digits = (self._digits + text)[-8:]
+            self._show_digits()
+        elif key == Qt.Key_Backspace:
+            if self._digits is None:
+                self._digits = re.sub(r'\D', '', self.text())
+            self._digits = self._digits[:-1]
+            self._show_digits()
+        elif key in (Qt.Key_Up, Qt.Key_Down):
+            nb = self.ticks()
+            if nb is not None:
+                step = self._rate if event.modifiers() & Qt.ShiftModifier else 1
+                nb = max(0, nb + (step if key == Qt.Key_Up else -step))
+                self._digits = None
+                self._show(ticks_to_tc(nb, self._rate, self._drop))
+        elif key == Qt.Key_Escape:
+            self._digits = None
+            self.setText(self._loaded)
+        elif key in (Qt.Key_Return, Qt.Key_Enter):
+            self.returnPressed.emit()
+        elif text and text.isprintable() and not event.modifiers() & (
+                Qt.ControlModifier | Qt.MetaModifier):
+            pass                              # ignore letters, separators, etc.
+        else:
+            super().keyPressEvent(event)      # navigation, copy, select all, Tab...
+            return
+        event.accept()
+
+    def dropEvent(self, event):               # drag-and-drop text
+        self._paste(event.mimeData().text())
+        event.acceptProposedAction()
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        for action in menu.actions():        # route the menu's Paste through _paste()
+            if action.text().replace("&", "").startswith("Paste"):
+                action.triggered.disconnect()
+                action.triggered.connect(
+                    lambda *_: self._paste(QGuiApplication.clipboard().text()))
+        if _QT == 6:
+            menu.exec(event.globalPos())
+        else:
+            menu.exec_(event.globalPos())
+
+    def _paste(self, text):
+        parts = parse_tc_text(text)
+        if parts is not None:
+            self._digits = None
+            self._show(parts)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._digits = None
+        QTimer.singleShot(0, self.selectAll)
+
+    def _update_style(self):
+        bad = bool(self.text()) and self.value() is None
+        self.setStyleSheet("border: 1px solid #c0392b;" if bad else "")
+
+
 # ─── OpenClip Editor Dialog ────────────────────────────────────────────────────
 
 class OpenClipEditorDialog(QDialog):
@@ -639,17 +799,14 @@ class OpenClipEditorDialog(QDialog):
 
         # Start TC
         g.addWidget(QLabel("Start TC:"), row, 0, Qt.AlignRight)
-        self.tc_hh = QSpinBox(); self.tc_hh.setRange(0, 23);  self.tc_hh.setFixedWidth(52)
-        self.tc_mm = QSpinBox(); self.tc_mm.setRange(0, 59);  self.tc_mm.setFixedWidth(52)
-        self.tc_ss = QSpinBox(); self.tc_ss.setRange(0, 59);  self.tc_ss.setFixedWidth(52)
-        self.tc_ff = QSpinBox(); self.tc_ff.setRange(0, 999); self.tc_ff.setFixedWidth(52)
+        self.tc_edit = TimecodeEdit()
+        self.tc_edit.returnPressed.connect(self._apply_timecode)
+        self.tc_edit.textChanged.connect(self._on_tc_text_changed)
         self.tc_info_label = QLabel("")
         self.tc_info_label.setStyleSheet("color: gray;")
-        apply_tc = QPushButton("Apply")
-        apply_tc.clicked.connect(self._apply_timecode)
-        tc_row = _hbox(self.tc_hh, QLabel(":"), self.tc_mm, QLabel(":"),
-                       self.tc_ss, QLabel(":"), self.tc_ff,
-                       8, self.tc_info_label, 'stretch', apply_tc)
+        self.apply_tc_btn = QPushButton("Apply")
+        self.apply_tc_btn.clicked.connect(self._apply_timecode)
+        tc_row = _hbox(self.tc_edit, 8, self.tc_info_label, 'stretch', self.apply_tc_btn)
         g.addWidget(tc_row, row, 1, 1, 2)
         row += 1
 
@@ -783,16 +940,15 @@ class OpenClipEditorDialog(QDialog):
         for w in [self.clip_name_edit, self.source_name_edit, self.track_name_edit,
                   self.remove_ver_btn, self.save_btn, self.feed_path_edit,
                   self.color_edit, self.start_frame_spin, self.end_frame_spin,
-                  self.ver_name_edit, self.tc_hh, self.tc_mm, self.tc_ss, self.tc_ff,
+                  self.ver_name_edit, self.tc_edit, self.apply_tc_btn,
                   self.current_version_cb]:
             w.setEnabled(enabled)
 
     def _clear_feed_details(self):
         self.ver_name_edit.setText("")
-        self.tc_hh.setValue(0)
-        self.tc_mm.setValue(0)
-        self.tc_ss.setValue(0)
-        self.tc_ff.setValue(0)
+        self._tc_duration = None
+        self.tc_edit.set_format(24)
+        self.tc_edit.set_ticks(None)
         self.tc_info_label.setText("")
         self.out_tc_label.setText("—")
         self.feed_path_edit.setText("")
@@ -883,6 +1039,7 @@ class OpenClipEditorDialog(QDialog):
 
     def _populate_feed_details(self, vuid):
         self._fill_feed_details(vuid)
+        self._on_tc_text_changed()
         self._feed_snapshot = self._feed_widget_values()
 
     def _refresh_feed_details(self):
@@ -894,8 +1051,7 @@ class OpenClipEditorDialog(QDialog):
         """Current Feed Details values, in the order pending edits are applied."""
         return OrderedDict([
             ("Version Name", self.ver_name_edit.text().strip()),
-            ("Start TC",     (self.tc_hh.value(), self.tc_mm.value(),
-                              self.tc_ss.value(), self.tc_ff.value())),
+            ("Start TC",     self.tc_edit.text()),
             ("Path",         self.feed_path_edit.text().strip()),
             ("Start Frame",  self.start_frame_spin.value()),
             ("End Frame",    self.end_frame_spin.value()),
@@ -949,17 +1105,11 @@ class OpenClipEditorDialog(QDialog):
             rate = tc_rate(tc_elem)
             nb   = int(tc_elem.findtext("nbTicks") or 0)
             drop = tc_is_drop(tc_elem)
-            hh, mm, ss, ff = ticks_to_tc(nb, rate, drop)
-            self.tc_hh.setValue(hh)
-            self.tc_mm.setValue(mm)
-            self.tc_ss.setValue(ss)
-            self.tc_ff.setValue(ff)
-            self.tc_info_label.setText(f"{'DF' if drop else 'NDF'}  {rate}fps")
-            duration = self._get_feed_duration(feed)
-            if duration is not None:
-                oh, om, os_, of_ = ticks_to_tc(nb + duration, rate, drop)
-                self.out_tc_label.setText(
-                    f"{tc_to_str(oh, om, os_, of_, drop)}  ({duration} frames)")
+            self._tc_duration = self._get_feed_duration(feed)
+            self.tc_edit.set_format(rate, drop)
+            self.tc_edit.set_ticks(nb)      # also fills Out TC via _on_tc_text_changed
+            self.tc_info_label.setText(
+                f"{'DF' if drop else 'NDF'}  {self._feed_fps_text(feed, rate)}")
 
         # Path
         span = feed.find("spans/span")
@@ -1005,6 +1155,27 @@ class OpenClipEditorDialog(QDialog):
             if depth:
                 fmt_str += f"   {depth}-bit {enc}".rstrip()
             self.format_label.setText(fmt_str)
+
+    @staticmethod
+    def _feed_fps_text(feed, tc_rate_):
+        """'23.976 fps' from the feed's sampleRate, else the timecode rate."""
+        sr = feed.find("sampleRate")
+        try:
+            fps = int(sr.findtext("numerator")) / int(sr.findtext("denominator"))
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+            fps = tc_rate_
+        return f"{fps:.3f}".rstrip("0").rstrip(".") + " fps"
+
+    def _on_tc_text_changed(self, _text=None):
+        """Live Out TC preview and Apply state while the Start TC is being typed."""
+        nb = self.tc_edit.ticks()
+        self.apply_tc_btn.setEnabled(nb is not None and self.tc_edit.isEnabled())
+        if nb is None or self._tc_duration is None:
+            self.out_tc_label.setText("—")
+            return
+        rate, drop = self.tc_edit._rate, self.tc_edit._drop
+        out = tc_display(*ticks_to_tc(nb + self._tc_duration, rate, drop), rate, drop)
+        self.out_tc_label.setText(f"{out}  ({self._tc_duration} frames)")
 
     def _get_feed_duration(self, feed):
         span = feed.find("spans/span")
@@ -1063,10 +1234,12 @@ class OpenClipEditorDialog(QDialog):
     def _apply_timecode(self):
         if not self._current_vuid:
             return
-        hh = self.tc_hh.value()
-        mm = self.tc_mm.value()
-        ss = self.tc_ss.value()
-        ff = self.tc_ff.value()
+        parts = self.tc_edit.value()
+        if parts is None:
+            self._warn("Invalid Timecode",
+                       f"'{self.tc_edit.text()}' isn't a valid timecode at this frame rate.")
+            return
+        hh, mm, ss, ff = parts
 
         # Every track's feed for this version (video + audio) so they stay in sync
         targets = []
@@ -1404,6 +1577,10 @@ class OpenClipEditorDialog(QDialog):
             return
         dlg = FixPathsDialog(self)
         _exec(dlg)
+
+    def reject(self):
+        # Esc would otherwise hide the window without the unsaved-changes prompt
+        self.close()
 
     def closeEvent(self, event):
         if not self._maybe_save_changes():
