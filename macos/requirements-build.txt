@@ -1,0 +1,3 @@
+# Build-time only: bundled into the .app by build_dmg.sh
+pyinstaller==6.16.0
+PySide6-Essentials==6.10.2

@@ -1,6 +1,6 @@
 """
 Script Name:    OpenClip Editor
-Script Version: 2.0.0
+Script Version: 2.1.0
 Flame Version:  2023.2+
 
 Description:
@@ -42,7 +42,7 @@ try:
         QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy, QMenuBar,
         QRadioButton, QScrollArea,
     )
-    from PySide6.QtCore import Qt, QTimer
+    from PySide6.QtCore import Qt, QTimer, QEvent
     from PySide6.QtGui import (QAction, QKeySequence, QFont, QColor,
                                QStandardItemModel, QStandardItem, QBrush)
     _QT = 6
@@ -55,7 +55,7 @@ except ImportError:
             QHBoxLayout, QVBoxLayout, QGridLayout, QSizePolicy, QMenuBar,
             QAction, QRadioButton, QScrollArea,
         )
-        from PySide2.QtCore import Qt, QTimer
+        from PySide2.QtCore import Qt, QTimer, QEvent
         from PySide2.QtGui import (QKeySequence, QFont, QColor,
                                    QStandardItemModel, QStandardItem, QBrush)
         _QT = 2
@@ -64,7 +64,7 @@ except ImportError:
 
 
 SCRIPT_NAME    = 'OpenClip Editor'
-SCRIPT_VERSION = 'v2.0.0'
+SCRIPT_VERSION = 'v2.1.0'
 
 
 # ─── Timecode utilities ────────────────────────────────────────────────────────
@@ -382,6 +382,11 @@ def write_clip(tree, path, backup=False):
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def _exec(obj):
+    """exec() on PySide6 (where exec_ is deprecated), exec_() on PySide2."""
+    return obj.exec() if _QT == 6 else obj.exec_()
+
 
 def _separator(orientation='h'):
     line = QFrame()
@@ -1331,7 +1336,7 @@ class OpenClipEditorDialog(QDialog):
         msg.setStandardButtons(
             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         msg.setDefaultButton(QMessageBox.Save)
-        reply = msg.exec_()
+        reply = _exec(msg)
         if reply == QMessageBox.Cancel:
             return False
         if reply == QMessageBox.Save:
@@ -1398,7 +1403,7 @@ class OpenClipEditorDialog(QDialog):
             QMessageBox.information(self, "No File", "Please open a .clip file first.")
             return
         dlg = FixPathsDialog(self)
-        dlg.exec_()
+        _exec(dlg)
 
     def closeEvent(self, event):
         if not self._maybe_save_changes():
@@ -1733,7 +1738,7 @@ class PreviewDialog(QDialog):
         close = QPushButton("Close")
         close.clicked.connect(self.accept)
         lay.addWidget(close, alignment=Qt.AlignRight)
-        self.exec_()
+        _exec(self)
 
 
 # ─── Flame integration helpers ────────────────────────────────────────────────
@@ -1752,6 +1757,25 @@ def _flame_refresh_mediahub():
 _open_dialogs = []   # keep references so Qt doesn't GC non-modal windows
 
 
+def _show_editor(clip_path=None):
+    """Show *clip_path* in an editor window, reusing an empty window if there is one."""
+    for dlg in _open_dialogs:
+        if dlg.tree is None:
+            if clip_path:
+                dlg._load_file(clip_path)
+            break
+    else:
+        dlg = OpenClipEditorDialog(clip_path)
+        dlg.setAttribute(Qt.WA_DeleteOnClose)
+        dlg.destroyed.connect(lambda obj=None, d=dlg: _open_dialogs.remove(d)
+                               if d in _open_dialogs else None)
+        _open_dialogs.append(dlg)
+    dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
+    return dlg
+
+
 def _open_editor(selection):
     if _QT is None:
         print(f"\n[{SCRIPT_NAME}] ERROR: PySide2/PySide6 not found in this Python environment.")
@@ -1764,14 +1788,7 @@ def _open_editor(selection):
             continue
         if not clip_path.endswith('.clip') or not os.path.isfile(clip_path):
             continue
-        dlg = OpenClipEditorDialog(clip_path)
-        dlg.setAttribute(Qt.WA_DeleteOnClose)
-        dlg.destroyed.connect(lambda obj=None, d=dlg: _open_dialogs.remove(d)
-                               if d in _open_dialogs else None)
-        _open_dialogs.append(dlg)
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        _show_editor(clip_path)
 
 
 def _scope_clip(selection):
@@ -1800,14 +1817,36 @@ def get_mediahub_files_custom_ui_actions():
     ]
 
 
-# ─── Standalone entry point ────────────────────────────────────────────────────
+# ─── Standalone app (macOS .app, or `python3 openclip_editor.py`) ─────────────
 
-if __name__ == "__main__":
+if _QT is not None:
+    class _EditorApp(QApplication):
+        """Opens .clip files handed over by Finder (double-click, Open With, Dock drop)."""
+
+        def event(self, e):
+            if e.type() == QEvent.FileOpen:
+                path = e.file()
+                if path and os.path.isfile(path):
+                    _show_editor(path)
+                return True
+            return super().event(e)
+
+
+def main(argv=None):
+    argv = sys.argv if argv is None else argv
     if _QT is None:
         print("PySide2 or PySide6 is required.  Install with:  pip install PySide6")
-        sys.exit(1)
-    app = QApplication.instance() or QApplication(sys.argv)
-    clip = sys.argv[1] if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]) else None
-    dlg  = OpenClipEditorDialog(clip)
-    dlg.show()
-    sys.exit(app.exec_() if _QT == 2 else app.exec())
+        return 1
+    app = QApplication.instance() or _EditorApp(argv)
+    app.setApplicationName(SCRIPT_NAME)
+    for arg in argv[1:]:
+        if os.path.isfile(arg):
+            _show_editor(arg)
+    # Finder sends the double-clicked file as a FileOpen event just after start-up,
+    # so only fall back to an empty window if nothing has opened by then.
+    QTimer.singleShot(500, lambda: _open_dialogs or _show_editor())
+    return _exec(app)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
